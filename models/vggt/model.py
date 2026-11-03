@@ -98,19 +98,23 @@ class MiniVGGT(nn.Module):
         temporal/view-order positional embedding; camera 0 is already marked.
         Save the final frame block's output before its global block updates it.
         """
+        b, v, n, d = tokens.shape
+        global_positions = self.positions.repeat(v, 1)  # (V*N,2), same grid for each view
+        frame_out = None
         for i, block in enumerate(self.blocks):
             if i % 2 == 0:
                 # TODO (Q3.0): Frame attention; reshape to (B*V,N,D), call
                 # block with self.positions, restore (B,V,N,D), and save
                 # this frame output for the final concatenation.
-                ...
+                tokens = block(tokens.reshape(b * v, n, d), self.positions).reshape(b, v, n, d)
+                frame_out = tokens
             else:
                 # TODO (Q3.0): Global attention; reshape to (B,V*N,D), call
                 # block with positions repeated per view, restore (B,V,N,D).
-                ...
+                tokens = block(tokens.reshape(b, v * n, d), global_positions).reshape(b, v, n, d)
         # TODO (Q3.0): Concatenate the final frame/global outputs along D
         # and return self.norm(...) with shape (B,V,N,2D).
-        raise NotImplementedError("Q3.0: MiniVGGT.aggregate")
+        return self.norm(torch.cat([frame_out, tokens], dim=-1))
 
     def forward(
         self, inputs: dict[str, torch.Tensor]

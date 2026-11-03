@@ -64,7 +64,8 @@ class CameraHead(nn.Module):
         Do not normalize or flip the quaternion before the camera loss.
         """
         # TODO (Q3.0): Apply self.mlp and the FoV activation above.
-        raise NotImplementedError("Q3.0: CameraHead.predict")
+        raw = self.mlp(camera_features).float()  # (B,V,9)
+        return torch.cat([raw[..., :7], F.relu(raw[..., 7:])], dim=-1)
 
 
 class DepthHead(nn.Module):
@@ -97,13 +98,19 @@ class DepthHead(nn.Module):
         """
         b, v, _, h, w = rgb.shape
         # TODO (Q3.0): Apply self.dense and the provided patches_to_image.
-        dense = None  # (B,V,self.channels,H,W).
+        p = self.patch_size
+        dense = patches_to_image(self.dense(patches), (h, w), p, self.channels)  # (B,V,self.channels,H,W).
         # TODO (Q3.0): Add self.refine([dense, rgb]) as a dense residual.
         # Flatten B,V before Conv2d, then restore them.
-        refined = None  # (B,V,self.channels,H,W).
+        refine_in = torch.cat([dense, rgb.to(dense.dtype)], dim=2).flatten(0, 1)
+        refined = dense + self.refine(refine_in).reshape(b, v, self.channels, h, w)  # (B,V,self.channels,H,W).
         # TODO (Q3.0): Project confidence, reconstruct its map, and activate
         # depth/confidence.
-        raise NotImplementedError("Q3.0: DepthHead.forward")
+        confidence = patches_to_image(self.confidence(patches), (h, w), p, 1)
+        return {
+            "depth": torch.exp(refined.float()),
+            "depth_conf": 1 + torch.exp(confidence.float()),
+        }
 
 
 class PointHead(nn.Module):

@@ -62,11 +62,12 @@ def train_one_epoch(
 
         # TODO (Q2.0): Run model(inputs) under torch.autocast with
         # device.type, bfloat16 and enabled=amp.
-        predictions = None
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
+            predictions = model(inputs)
         # TODO (Q2.0): Cast every prediction to float32 (the loss is computed
         # outside autocast), then compute the loss with compute_loss.
-        loss = None
-        raise NotImplementedError("Q2.0: train_one_epoch")
+        predictions = {k: v.float() for k, v in predictions.items()}
+        loss = compute_loss(predictions, targets)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()

@@ -20,8 +20,7 @@ def view_synthesis_loss(pred_rgb, target_rgb):
         depth validity does not mask RGB.
     """
     # TODO (Q2.0): Mean squared error over every element of both tensors.
-    loss = None  # Scalar ().
-    raise NotImplementedError("Q2.0: view_synthesis_loss")
+    loss = F.mse_loss(pred_rgb, target_rgb, reduction="mean")  # Scalar ().
     return loss
 
 

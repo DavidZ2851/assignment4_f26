@@ -19,6 +19,16 @@ import torch
 from a4data.scale import compute_scene_scale
 
 
+def _pixel_grid(H: int, W: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """(H, W, 3) homogeneous pixel centers [u, v, 1]; u is the column, v the row."""
+    v, u = torch.meshgrid(
+        torch.arange(H, dtype=dtype, device=device),
+        torch.arange(W, dtype=dtype, device=device),
+        indexing="ij",
+    )
+    return torch.stack([u, v, torch.ones_like(u)], dim=-1)
+
+
 def resize_intrinsics(
     K: torch.Tensor, input_hw: tuple[int, int], output_hw: tuple[int, int]
 ) -> torch.Tensor:
@@ -35,8 +45,15 @@ def resize_intrinsics(
             x_out + 0.5 = (size_out / size_in) * (x_in + 0.5).
     """
     # TODO (Q1.1): Update focal lengths and principal point for the resize.
-    K_resized = None  # (3, 3)
-    raise NotImplementedError("Q1.1: resize_intrinsics")
+    sy = output_hw[0] / input_hw[0]
+    sx = output_hw[1] / input_hw[1]
+    K_resized = K.clone()  # (3, 3)
+    K_resized[0, 0] = K[0, 0] * sx
+    K_resized[1, 1] = K[1, 1] * sy
+    K_resized[0, 1] = K[0, 1] * sx  # skew (zero for these cameras)
+    # x_out = s * (x_in + 0.5) - 0.5
+    K_resized[0, 2] = sx * (K[0, 2] + 0.5) - 0.5
+    K_resized[1, 2] = sy * (K[1, 2] + 0.5) - 0.5
     return K_resized
 
 
@@ -59,14 +76,18 @@ def unproject_depth(
     H, W = depth.shape[-2:]
 
     # TODO (Q1.2): Build homogeneous pixel coordinates.
-    pixels = None  # (H, W, 3)
+    pixels = _pixel_grid(H, W, depth.dtype, depth.device)  # (H, W, 3)
 
     # TODO (Q1.2): Unproject pixels to camera-space points using K and z-depth.
-    points_camera = None  # (V, H, W, 3)
+    # K^-1 [u, v, 1] has z = 1, so scaling by the z-depth gives the camera point.
+    K_inv = torch.linalg.inv(K)  # (V, 3, 3)
+    rays_camera = torch.einsum("vij,hwj->vhwi", K_inv, pixels)  # (V, H, W, 3)
+    points_camera = rays_camera * depth[:, 0, :, :, None]  # (V, H, W, 3)
 
     # TODO (Q1.2): Transform camera-space points into world coordinates.
-    points_world = None  # (V, H, W, 3)
-    raise NotImplementedError("Q1.2: unproject_depth")
+    R = T_world_from_camera[:, :3, :3]
+    t = T_world_from_camera[:, :3, 3]
+    points_world = torch.einsum("vij,vhwj->vhwi", R, points_camera) + t[:, None, None, :]
     return points_world
 
 
@@ -100,10 +121,14 @@ def canonicalize_cameras(
     do not subtract the centroid.
     """
     # TODO (Q1.3): Choose camera 0 as the reference and transform all poses.
-    original_world_from_reference = None  # (4, 4)
+    original_world_from_reference = T_world_from_camera[0].clone()  # (4, 4)
     # Compute relative transforms in float64 for precision, then cast to float32.
-    poses_relative = None  # (V, 4, 4)
-    raise NotImplementedError("Q1.3: canonicalize_cameras")
+    # T_ref_from_cam = (T_world_from_ref)^-1 @ T_world_from_cam
+    reference_from_world = torch.linalg.inv(original_world_from_reference.double())
+    poses_relative = (reference_from_world[None] @ T_world_from_camera.double()).to(
+        T_world_from_camera.dtype
+    )  # (V, 4, 4)
+    poses_relative[0] = torch.eye(4, dtype=poses_relative.dtype, device=poses_relative.device)
 
     # Use your Q1.2 implementation to compute points in the first camera's frame.
     points_reference = unproject_depth(K, poses_relative, depth)  # (V, H, W, 3)
@@ -113,9 +138,11 @@ def canonicalize_cameras(
 
     # TODO (Q1.3): Divide translations, depth and points by the same scale.
     # Keep camera 0 at the origin; do not subtract the point-cloud centroid.
-    poses_normalized = None  # (V, 4, 4)
-    depth_normalized = None  # (V, 1, H, W)
-    points_normalized = None  # (V, H, W, 3), invalid pixels zero
+    poses_normalized = poses_relative.clone()  # (V, 4, 4)
+    poses_normalized[:, :3, 3] = poses_relative[:, :3, 3] / scene_scale
+    depth_normalized = torch.where(depth_valid, depth / scene_scale, 0)  # (V, 1, H, W)
+    valid_hw = depth_valid[:, 0, :, :, None]  # (V, H, W, 1)
+    points_normalized = torch.where(valid_hw, points_reference / scene_scale, 0)  # (V, H, W, 3)
 
     return (
         poses_normalized,
@@ -147,17 +174,19 @@ def camera_rays(
     H, W = image_hw
 
     # TODO (Q1.4): Build homogeneous pixel coordinates for the image grid.
-    pixels = None  # (H, W, 3)
+    pixels = _pixel_grid(H, W, K.dtype, K.device)  # (H, W, 3)
 
     # TODO (Q1.4): Convert pixels to camera-space ray directions using K.
-    camera_directions = None  # (V, H, W, 3)
+    camera_directions = torch.einsum("vij,hwj->vhwi", torch.linalg.inv(K), pixels)  # (V, H, W, 3)
 
     # TODO (Q1.4): Rotate directions to world space and normalize each vector.
-    directions = None  # (V, H, W, 3)
+    R = T_world_from_camera[:, :3, :3]
+    directions = torch.einsum("vij,vhwj->vhwi", R, camera_directions)
+    directions = directions / directions.norm(dim=-1, keepdim=True)  # (V, H, W, 3)
 
     # TODO (Q1.4): Broadcast each camera center as the ray origins.
-    origins = None  # (V, H, W, 3)
-    raise NotImplementedError("Q1.4: camera_rays")
+    centers = T_world_from_camera[:, :3, 3]  # (V, 3)
+    origins = centers[:, None, None, :].expand(-1, H, W, -1).clone()  # (V, H, W, 3)
     return origins, directions
 
 
@@ -175,9 +204,8 @@ def plucker_coordinates(
             Use the convention m = o x d.
     """
     # TODO (Q1.5): Compute the ray moments.
-    moments = None  # (V, H, W, 3)
+    moments = torch.linalg.cross(origins, directions, dim=-1)  # (V, H, W, 3)
 
     # TODO (Q1.5): Concatenate directions and moments along the last dimension.
-    plucker = None  # (V, H, W, 6)
-    raise NotImplementedError("Q1.5: plucker_coordinates")
+    plucker = torch.cat([directions, moments], dim=-1)  # (V, H, W, 6)
     return plucker

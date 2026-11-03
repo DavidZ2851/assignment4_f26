@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16-825 Assignment 4</title>
+<style>
+:root { --bg:#fff; --fg:#1d1d1f; --muted:#5f6368; --line:#e3e3e3; --accent:#0b57d0; --code:#f4f4f6; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#141416; --fg:#e8e8ea; --muted:#a0a0a6; --line:#333; --accent:#8ab4f8; --code:#222226; } }
+body { background:var(--bg); color:var(--fg); font:16px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif; margin:0; }
+main { max-width:1000px; margin:0 auto; padding:24px 16px 80px; }
+h1 { font-size:1.9rem; margin-bottom:0; } h2 { border-bottom:1px solid var(--line); padding-bottom:6px; margin-top:48px; }
+h3 { margin-top:32px; } .muted { color:var(--muted); }
+img { max-width:100%; height:auto; border:1px solid var(--line); border-radius:4px; }
+figure { margin:16px 0; } figcaption { color:var(--muted); font-size:.9rem; }
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+@media (max-width:700px){ .grid2 { grid-template-columns:1fr; } }
+table { border-collapse:collapse; margin:12px 0; font-size:.95rem; display:block; overflow-x:auto; }
+th,td { border:1px solid var(--line); padding:4px 10px; text-align:center; } th { background:var(--code); }
+code,pre { background:var(--code); border-radius:4px; font-size:.88rem; } code { padding:1px 4px; }
+pre { padding:10px; overflow-x:auto; }
+b.best { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<h1>16-825 Assignment 4: Multi-View Transformers</h1>
+<p class="muted">Data preprocessing · Mini-LVSM novel-view synthesis · Mini-VGGT cameras and depth. All experiments on ScanNet++ (iPhone), 224 px, run on NVIDIA RTX 3090 GPUs.</p>
+
+<!-- ================================================================ -->
+<h2>Part 1. Data Preprocessing</h2>
+
+<h3>Unprojection</h3>
+<figure><img src="images/unprojection.png" alt="unprojection"><figcaption>Depth maps of all 8 views unprojected with their (resized) intrinsics and camera-to-world poses. Points from different views overlap consistently in a single world frame.</figcaption></figure>
+
+<h3>Canonicalization</h3>
+<figure><img src="images/canonicalization.png" alt="canonicalization"><figcaption>After canonicalization: the first camera (red frustum) is at the origin, center (0.0000, 0.0000, 0.0000); scene scale 1.867 m; valid-point centroid distance 1.000 normalized units.</figcaption></figure>
+
+<h3><code>check_data.py</code> output</h3>
+<pre>split: train, dataset_samples: 224, checked_samples: 4
+sample                      views  res  valid_depth  max_reproj_err(px)  max_ray_reproj_err(px)  centroid_dist
+e050c15a8d_frame_007080       8    224    0.978         1.13e-4              1.09e-4               1.0000
+5f99900f09_frame_002820       8    224    0.990         1.23e-4              1.11e-4               1.0000
+47b37eb6f9_frame_002720       8    224    0.961         0.99e-4              0.89e-4               1.0000
+4c5c60fa76_frame_006690       8    224    0.752         1.16e-4              1.07e-4               1.0000
+tensor shapes: images [2,8,3,224,224], ray_directions [2,8,3,224,224], plucker [2,8,6,224,224]</pre>
+<p class="muted">Full JSON is in <code>outputs/check_data.txt</code>. All reprojection errors are ~1e-4 px (float32 round-off), well below 0.01 px.</p>
+
+<h3>Explanations</h3>
+<ul>
+<li><b>Canonicalization.</b> Absolute ScanNet++ poses and metric scale are arbitrary: they depend on where the scan started and on the room size. Re-expressing every camera relative to the first one (<code>T'<sub>i</sub> = T<sub>0</sub><sup>-1</sup> T<sub>i</sub></code>, so camera 0 is the identity) removes the global rigid-transform ambiguity. Dividing translations, depths and points by the scene scale (distance from the camera-0 center to the valid-point centroid) removes the scale ambiguity. The network therefore always sees the same coordinate convention and a scale of about 1. This is also what makes predicting poses and depth from images well-posed, since images cannot reveal the absolute frame or metric scale.</li>
+<li><b>World-space ray directions.</b> For pixel (u, v), <code>K<sup>-1</sup>[u, v, 1]<sup>T</sup></code> is the viewing direction in camera coordinates (OpenCV: +x right, +y down, +z forward). Rotating it by the camera-to-world rotation, <code>d = normalize(R K<sup>-1</sup>[u,v,1]<sup>T</sup>)</code>, gives the direction in the shared world frame. The ray origin is the camera center <code>t</code>. Depth is z-depth, so the 3-D point is <code>X = t + depth · R K<sup>-1</sup>[u,v,1]<sup>T</sup></code> (unnormalized direction).</li>
+<li><b>Plücker moment.</b> A ray is encoded as <code>[d, m]</code> with <code>m = o × d</code>. The moment is the same for any point <code>o</code> on the line, since <code>(o + s d) × d = o × d</code>. So <code>(d, m)</code> represents the line itself, independent of where the origin is placed along it. <code>|m|</code> is the distance from the world origin to the line, and the direction of <code>m</code> is the normal of the plane containing the line and the origin. It gives a smooth, per-pixel 6-D encoding of camera pose + intrinsics, which is what the transformers consume.</li>
+</ul>
+
+<!-- ================================================================ -->
+<h2>Part 2. Novel-View Synthesis with Mini-LVSM</h2>
+<p>Decoder-only LVSM. Source views are patchified RGB (scaled to [-1, 1]) concatenated with Plücker rays, giving 9 channels. Target queries are patchified Plücker rays only, giving 6 channels. Both get a 2-D sin-cos position embedding. Each target view forms its own sequence <code>[all source tokens, target tokens]</code>, which goes through 8 pre-norm transformer blocks (QK-norm). The target tokens are decoded by a linear head + sigmoid and unpatchified. The loss is pixel MSE.</p>
+
+<h3>Q2.1 Overfitting</h3>
+<p>Final overfit validation PSNR: <b>30.92 dB</b> (SSIM 0.870).</p>
+<figure><img src="images/lvsm_overfit_val_epoch000.png" alt="overfit"><figcaption><code>outputs/lvsm_overfit/val_epoch000.png</code>. Columns: source views, ground truth, prediction.</figcaption></figure>
+
+<h3>Q2.2 Training and evaluation</h3>
+<p><b>Training settings.</b> These are the <code>configs/lvsm.json</code> defaults:</p>
+<ul>
+<li>Model: patch 8, d_model 384, 8 layers, head_dim 64, MLP ratio 4, QK-norm.</li>
+<li>Data: 2 source views + targets from the default data config, batch 4.</li>
+<li>Optimizer: AdamW, lr 2e-4 with β = (0.9, 0.95), weight decay 0.05, 200 warmup steps then cosine decay, grad-clip 1.0, bf16 autocast.</li>
+</ul>
+<p>I first ran the default 100 epochs (0.7 h). The curves were still rising and validation loss was below training loss, a clear sign of underfitting. So the main model was trained for <b>400 epochs</b> (2.7 h, one RTX 3090) with otherwise identical settings. Both runs are reported below; <code>best.pt</code> is selected by validation loss.</p>
+<figure><img src="images/lvsm_curves_long.png" alt="curves"><figcaption>Training curves (MSE, PSNR, val SSIM) for the 400-epoch run (blue) and the default 100-epoch run (orange). Validation is evaluated on fixed held-out scenes and frames, so it is less noisy than train. It is also slightly easier than random training samples, hence val &gt; train PSNR.</figcaption></figure>
+
+<p><b>Validation metrics</b> for the 400-epoch model, PSNR (dB) / SSIM:</p>
+<table>
+<tr><th>Source views</th><th>correct rays</th><th>shuffled rays</th><th>no rays (zeros)</th></tr>
+<tr><td>1</td><td>15.89 / 0.589</td><td>11.65 / 0.482</td><td>12.41 / 0.531</td></tr>
+<tr><td>2</td><td>17.17 / 0.599</td><td>11.25 / 0.460</td><td>12.37 / 0.528</td></tr>
+<tr><td>4</td><td><b class="best">18.35 / 0.621</b></td><td>11.29 / 0.456</td><td>12.38 / 0.539</td></tr>
+</table>
+<p>Default 100-epoch model, for reference:</p>
+<table>
+<tr><th>Source views</th><th>correct</th><th>shuffled</th><th>none</th></tr>
+<tr><td>1</td><td>15.19 / 0.558</td><td>11.80 / 0.487</td><td>12.47 / 0.529</td></tr>
+<tr><td>2</td><td>16.13 / 0.560</td><td>11.49 / 0.472</td><td>12.43 / 0.528</td></tr>
+<tr><td>4</td><td>16.87 / 0.575</td><td>11.58 / 0.473</td><td>12.44 / 0.538</td></tr>
+</table>
+
+<p><b>Training visualizations</b> (columns: source views, ground truth, prediction):</p>
+<div class="grid2">
+<figure><img src="images/lvsm_train_epoch000.png" alt=""><figcaption>Epoch 0</figcaption></figure>
+<figure><img src="images/lvsm_train_epoch380.png" alt=""><figcaption>Epoch 380</figcaption></figure>
+</div>
+<p><b>Evaluation visualizations</b> (400-epoch model, columns: source views, ground truth, prediction):</p>
+<div class="grid2">
+<figure><img src="images/lvsm_eval_S1_correct.png" alt=""><figcaption>S=1, correct rays</figcaption></figure>
+<figure><img src="images/lvsm_eval_S2_correct.png" alt=""><figcaption>S=2, correct rays</figcaption></figure>
+<figure><img src="images/lvsm_eval_S4_correct.png" alt=""><figcaption>S=4, correct rays</figcaption></figure>
+<figure><img src="images/lvsm_eval_S2_shuffled.png" alt=""><figcaption>S=2, shuffled rays</figcaption></figure>
+<figure><img src="images/lvsm_eval_S2_none.png" alt=""><figcaption>S=2, no rays</figcaption></figure>
+<figure><img src="images/lvsm_eval_S1_shuffled.png" alt=""><figcaption>S=1, shuffled rays</figcaption></figure>
+<figure><img src="images/lvsm_eval_S1_none.png" alt=""><figcaption>S=1, no rays</figcaption></figure>
+<figure><img src="images/lvsm_eval_S4_shuffled.png" alt=""><figcaption>S=4, shuffled rays</figcaption></figure>
+<figure><img src="images/lvsm_eval_S4_none.png" alt=""><figcaption>S=4, no rays</figcaption></figure>
+</div>
+
+<p><b>Discussion.</b></p>
+<ul>
+<li><b>Number of source views.</b> More source views help monotonically: 15.9 → 17.2 → 18.3 dB for 1 → 2 → 4 views, even though the model was trained with only 2. More views cover more of the target's visible content and constrain geometry better, so the model interpolates rather than hallucinates. Attention over a variable-length set of source tokens generalizes to a different number of views without retraining.</li>
+<li><b>Ray conditioning.</b> Removing the target rays (zeros) drops PSNR by about 5–6 dB. That output does not depend on the number of source views at all (≈12.4 dB everywhere): without knowing where the target camera is, the model can only output a blurry "average view" of the scene. <b>Shuffled</b> rays are even worse than none (11.3 dB, lowest SSIM), because the model confidently renders the scene from the wrong viewpoint. Together these show that the model really uses the Plücker target rays to choose the viewpoint, rather than copying a source image.</li>
+<li><b>Quality.</b> Predictions get the coarse layout, colors and large objects right at the correct place, but are blurry with visible 8×8 patch artifacts. This is expected for a small model (≈15M parameters) trained for a few GPU-hours on 224 training sequences with an MSE loss: MSE averages over uncertainty. Longer training was still improving (curves not converged), so more compute or a perceptual/SSIM loss would sharpen results.</li>
+</ul>
+
+<h3>Q2.3 Bonus: training view count</h3>
+<p><b>Question.</b> How does the number of source views used during training affect evaluation with 1, 2 and 4 source views?</p>
+<p><b>Setting.</b> This is a controlled comparison: three models with identical settings (default config, 100 epochs, same seed and schedule). Only <code>num_source_views</code> changes during training (1, 2 or 4). Each model is evaluated on the same validation set at S = 1, 2, 4 with correct rays.</p>
+<table>
+<tr><th>Train S \ Eval S</th><th>1</th><th>2</th><th>4</th><th>train time</th></tr>
+<tr><td>1</td><td>15.12 / 0.559</td><td>14.90 / 0.553</td><td>14.64 / 0.561</td><td>0.52 h</td></tr>
+<tr><td>2</td><td>15.19 / 0.558</td><td>16.13 / 0.560</td><td>16.87 / 0.575</td><td>0.68 h</td></tr>
+<tr><td>4</td><td><b class="best">15.31</b> / 0.556</td><td><b class="best">16.41 / 0.562</b></td><td><b class="best">17.45 / 0.580</b></td><td>0.87 h</td></tr>
+</table>
+<figure><img src="images/lvsm_bonus_views.png" alt=""><figcaption>Validation PSNR/SSIM against the number of evaluation source views for models trained with 1, 2 and 4 source views.</figcaption></figure>
+<figure><img src="images/lvsm_curves_bonus.png" alt=""><figcaption>Training curves of the three models trained with 1, 2 and 4 source views (100 epochs each)</figcaption></figure>
+<div class="grid2">
+<figure><img src="images/lvsm_s1model_S4.png" alt=""><figcaption>Model trained with S=1, evaluated at S=4</figcaption></figure>
+<figure><img src="images/lvsm_s4model_S4.png" alt=""><figcaption>Model trained with S=4, evaluated at S=4</figcaption></figure>
+</div>
+<p><b>Findings.</b></p>
+<ul>
+<li>The model trained with <b>one</b> view cannot use extra views: its PSNR even <i>drops</i> from 15.1 to 14.6 dB as views are added. It never learned to fuse information across source views, so extra source tokens only act as distractors.</li>
+<li>Training with ≥2 views teaches cross-view fusion, which then extrapolates to more views.</li>
+<li>Training with 4 views is best at <i>every</i> evaluation count, including S=1 (+0.1–0.6 dB over S=2). Each step gives a stronger multi-view geometric signal, and the target is usually well covered, so the gradients are informative rather than "hallucinate unseen content".</li>
+<li>The cost is a longer sequence: the S=4 model trains about 1.3× slower than S=2 for the same epochs.</li>
+</ul>
+<p><b>Limitations.</b> These are 100-epoch runs (all still underfitting), with one seed each. The gaps at S=1 (≈0.2 dB) are within run-to-run noise. A random number of views per step was not tested, but would likely combine the S=1 robustness with the S=4 fusion ability.</p>
+
+<!-- ================================================================ -->
+<h2>Part 3. Cameras and Depth with Mini-VGGT</h2>
+<p>Architecture:</p>
+<ul>
+<li><b>Encoder:</b> frozen DINOv2 ViT-B/14 patch features, projected to 384-d, plus per-view camera and register tokens.</li>
+<li><b>Aggregator:</b> 8 alternating attention pairs. Frame attention runs within each view; global attention runs across all tokens of all views. The frame and global outputs of the final pair are concatenated.</li>
+<li><b>Camera head:</b> predicts a 9-d pose encoding per view (translation, quaternion, FoV).</li>
+<li><b>Depth head:</b> a DPT-style dense head with RGB refinement predicts log-depth and a confidence.</li>
+</ul>
+<p>Losses:</p>
+<ul>
+<li>Camera: L1 on translation, quaternion and FoV.</li>
+<li>Depth: confidence-weighted regression (trimmed mean of <code>c·|Δ| − 0.2·log c</code>), plus a gradient-matching term.</li>
+</ul>
+
+<h3>Q3.1 Overfitting a single scene</h3>
+<p>After 40 epochs on one scene, camera loss is 0.0026. The total loss becomes negative (−0.15) because of the −log(confidence) term. Predicted geometry matches GT; the predicted centroid distance is 0.999.</p>
+<figure><img src="images/vggt_overfit_loss.png" alt=""><figcaption>Overfit loss curves (total, camera, depth)</figcaption></figure>
+<div class="grid2">
+<figure><img src="images/vggt_overfit_gt.png" alt=""><figcaption>GT cameras + depth</figcaption></figure>
+<figure><img src="images/vggt_overfit_prediction.png" alt=""><figcaption>Predicted cameras + depth</figcaption></figure>
+</div>
+
+<h3>Q3.2 Training and evaluation</h3>
+<p><b>Training settings.</b> These are the <code>configs/vggt.json</code> defaults:</p>
+<ul>
+<li>Data: 8 views sampled within a 32-frame range, 224 px, batch 16.</li>
+<li>Model: embed 384, 6 heads, 8 layers, frozen DINOv2 ViT-B/14.</li>
+<li>Optimizer: AdamW, lr 6e-4, weight decay 0.01, 10 warmup epochs, cosine decay to 0.05×.</li>
+<li>Loss weights: camera 5, depth 1.</li>
+<li>Schedule: 1000 epochs (14 steps each, 224 training sequences), bf16, one RTX 3090, 4.4 h. The best checkpoint (by validation loss) is from epoch 911.</li>
+</ul>
+<p>Evaluation uses 8 views from the first 32 prepared frames, 224 px, seed 825, on the full splits.</p>
+<figure><img src="images/vggt_train_loss.png" alt=""><figcaption>Normal-training loss curves (total, camera, depth; unweighted components)</figcaption></figure>
+
+<table>
+<tr><th rowspan="2">Split</th><th rowspan="2">AbsRel ↓</th><th rowspan="2">δ1 ↑</th><th colspan="3">Rotation AUC ↑</th><th colspan="3">Translation AUC ↑</th><th colspan="3">Joint pose AUC ↑</th></tr>
+<tr><th>@5</th><th>@15</th><th>@30</th><th>@5</th><th>@15</th><th>@30</th><th>@5</th><th>@15</th><th>@30</th></tr>
+<tr><td>val</td><td>0.154</td><td>0.814</td><td>0.245</td><td>0.567</td><td>0.735</td><td>0.025</td><td>0.085</td><td>0.196</td><td>0.011</td><td>0.072</td><td>0.180</td></tr>
+<tr><td>test</td><td>0.167</td><td>0.770</td><td>0.213</td><td>0.536</td><td>0.716</td><td>0.014</td><td>0.054</td><td>0.157</td><td>0.004</td><td>0.034</td><td>0.137</td></tr>
+</table>
+<p class="muted">Each split has 28 samples and 784 pose pairs, with no degenerate pairs. Mean rotation error is 11.3° (val) / 10.1° (test); mean translation-direction error is 42.2° / 42.9°.</p>
+
+<p><b>GT vs prediction on four validation scenes</b> (left: GT camera + depth, right: predicted camera + depth):</p>
+<div class="grid2">
+<figure><img src="images/vggt_scene0_gt.png" alt=""><figcaption>Scene 0, GT</figcaption></figure>
+<figure><img src="images/vggt_scene0_prediction.png" alt=""><figcaption>Scene 0, prediction</figcaption></figure>
+<figure><img src="images/vggt_scene1_gt.png" alt=""><figcaption>Scene 1, GT</figcaption></figure>
+<figure><img src="images/vggt_scene1_prediction.png" alt=""><figcaption>Scene 1, prediction</figcaption></figure>
+<figure><img src="images/vggt_scene2_gt.png" alt=""><figcaption>Scene 2, GT</figcaption></figure>
+<figure><img src="images/vggt_scene2_prediction.png" alt=""><figcaption>Scene 2, prediction</figcaption></figure>
+<figure><img src="images/vggt_scene3_gt.png" alt=""><figcaption>Scene 3, GT</figcaption></figure>
+<figure><img src="images/vggt_scene3_prediction.png" alt=""><figcaption>Scene 3, prediction</figcaption></figure>
+</div>
+
+<p><b>Discussion of held-out errors.</b></p>
+<ul>
+<li><b>Depth is good.</b> δ1 is 0.81 / 0.77 and AbsRel 0.15 / 0.17. Predicted point clouds recover the room layout (floor, walls, furniture) and the depth maps are smooth with correct ordering. The main errors are over-smoothed depth discontinuities: in scene 0 the table and chairs merge into one blob, and thin structures such as chair legs and backs disappear. Depth benefits from the strong frozen DINOv2 features, which carry a lot of monocular depth information.</li>
+<li><b>Rotation is reasonable.</b> 73% AUC@30 on val, 11° mean error.</li>
+<li><b>Translation direction is the weak point.</b> AUC@30 is only about 0.2, and since joint pose AUC takes the worse of the two errors, it is limited by translation. Several factors contribute:
+  <ul>
+  <li>Frames come from 32 consecutive iPhone frames, so baselines are small relative to scene depth (all frusta sit in a tight cluster in the screenshots). The translation <i>direction</i> of a short baseline is ill-conditioned: a small absolute error becomes a large angular error.</li>
+  <li>The model has to infer it from parallax.</li>
+  <li>Only 224 training sequences are available. Val camera loss was still slowly decreasing at epoch 1000, so more data or compute should help.</li>
+  </ul>
+  In the screenshots, the predicted frusta follow the overall trajectory but their positions deviate from GT.</li>
+<li><b>Generalization.</b> Test is slightly worse than val for depth and pose, consistent with distribution shift across rooms. Training loss stays above validation loss because training samples random frame subsets, while evaluation uses a fixed, easier subset; it does not mean the model is underfit.</li>
+</ul>
+
+<h3>Q3.3 Bonus: number of input views</h3>
+<p><b>Question.</b> How does the number of input views affect accuracy, runtime and memory?</p>
+<p><b>Setting.</b> The trained model (8 views) is evaluated on the val split with 2, 4, 8 and 16 views drawn from the first 32 prepared frames (same seed 825, 224 px). Latency and peak memory are measured for one forward pass (batch 1, bf16, RTX 3090, averaged after warm-up) for 2–32 views.</p>
+<table>
+<tr><th>Views</th><th>AbsRel ↓</th><th>δ1 ↑</th><th>Rot AUC@15</th><th>Rot AUC@30</th><th>Trans AUC@30</th><th>Pose AUC@30</th><th>pairs</th></tr>
+<tr><td>2</td><td><b class="best">0.117</b></td><td><b class="best">0.857</b></td><td>0.600</td><td>0.746</td><td>0.229</td><td>0.187</td><td>28</td></tr>
+<tr><td>4</td><td>0.137</td><td>0.851</td><td>0.548</td><td>0.717</td><td>0.186</td><td>0.157</td><td>168</td></tr>
+<tr><td>8 (train)</td><td>0.154</td><td>0.814</td><td>0.567</td><td>0.735</td><td>0.196</td><td>0.180</td><td>784</td></tr>
+<tr><td>16</td><td>0.185</td><td>0.755</td><td>0.516</td><td>0.706</td><td>0.167</td><td>0.148</td><td>3360</td></tr>
+</table>
+<table>
+<tr><th>Views</th><th>2</th><th>4</th><th>8</th><th>16</th><th>24</th><th>32</th></tr>
+<tr><td>ms / forward</td><td>25.8</td><td>27.0</td><td>25.5</td><td>41.4</td><td>60.1</td><td>83.8</td></tr>
+<tr><td>ms / view</td><td>12.9</td><td>6.8</td><td>3.2</td><td>2.6</td><td>2.5</td><td>2.6</td></tr>
+<tr><td>peak memory (GB)</td><td>0.74</td><td>0.76</td><td>0.80</td><td>0.89</td><td>0.97</td><td>1.05</td></tr>
+</table>
+<figure><img src="images/vggt_bonus_views.png" alt=""><figcaption>Accuracy, latency and memory against the number of input views</figcaption></figure>
+<p><b>Findings.</b></p>
+<ul>
+<li><b>More views do not help this model; depth gets steadily worse.</b> AbsRel rises from 0.117 to 0.185 for 2 → 16 views. Pose AUC is roughly flat with a slight downward trend.</li>
+<li><b>Train/test mismatch.</b> The model was only ever trained with 8 views. With 16 views the global attention spreads over twice as many tokens, a distribution it never saw. Each view's depth is then contaminated by more weakly-related tokens.</li>
+<li><b>Different difficulty per setting.</b> More views inside a fixed 32-frame window means more pairs, including wider-baseline pairs that are harder for pose. With 2 views, the depth metric is dominated by the reference view and its nearby frame.</li>
+<li><b>No multi-view benefit for depth.</b> Depth is mostly predicted monocularly from DINO features, so extra views add little.</li>
+<li><b>Runtime and memory are cheap at this scale.</b> Up to 8 views the forward pass is launch-overhead bound (≈26 ms). Beyond that latency grows roughly linearly, as the frozen DINOv2 encoder (per-view cost) dominates. The quadratic global attention over 256·V tokens is still small at V ≤ 32. Per-view cost falls from 12.9 ms to 2.6 ms, and peak memory grows only from 0.74 to 1.05 GB, mostly the DINOv2 weights.</li>
+</ul>
+<p><b>Limitations.</b> This is evaluation-time only. Training with a random number of views (e.g. 2–16) would probably remove the degradation at 16 views, and would be the natural next experiment. The metrics with different view counts are computed over different pair sets, so they are not strictly comparable.</p>
+</main></body>
+</html>
