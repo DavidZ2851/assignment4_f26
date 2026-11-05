@@ -1,23 +1,40 @@
-# 16-825 Assignment 4: Multi-View Transformers
+# 16-825 Assignment 4: Multi-View Transformers (hzhan2)
 
-Goals: In this assignment, you will prepare a multi-view dataset, synthesize novel views with a mini-LVSM model, and reconstruct 3D geometry from images with a mini-VGGT model.
+My submission for Assignment 4: multi-view data preprocessing, novel-view synthesis with Mini-LVSM, and camera + depth prediction with Mini-VGGT, all on the ScanNet++ iPhone data at 224 px.
+
+The write-up with all results, plots and discussion is in **`index.html`** (open it in a browser; the figures are in `images/`).
+
+## What's in here
+
+```
+main.py            one entry point that runs every step below
+index.html         report webpage
+images/            figures used by the report
+a4data/            data loading + my Q1 geometry code (geometry.py)
+models/lvsm/       Mini-LVSM (Q2): model.py, losses.py, train.py, eval.py
+models/vggt/       Mini-VGGT (Q3): model.py, heads.py, losses.py, train.py, eval.py
+configs/           training configs (lvsm_long.json = 400-epoch run, lvsm_s1/s4 = Q2.3 bonus)
+scripts/           data visualization and checks for Q1
+tools/             my helper scripts: plotting, viewer screenshots, VGGT view-count benchmark
+docs/              the original assignment handout for each part
+```
+
+The code I wrote is in:
+
+- `a4data/geometry.py`: resizing intrinsics, depth unprojection, canonicalization, camera rays and Plücker coordinates (Q1.1–Q1.5).
+- `models/lvsm/`: patchify/unpatchify, token building, forward pass, MSE loss and the autocast training step (Q2).
+- `models/vggt/`: frame/global alternating attention, camera and depth heads, and the camera/depth/gradient losses (Q3).
 
 ## Setup
 
-Run all assignment commands from the repository root. Install PyTorch for your machine, then install the assignment dependencies:
+Install PyTorch for your machine, then from the repository root:
 
 ```bash
 pip install -r requirements.txt
 pip install -e . --no-deps
 ```
 
-
-
-### Dataset
-
-We use prepared iPhone RGB/depth frames from [ScanNet++](https://github.com/scannetpp/scannetpp). The supplied subset contains 280 indoor scenes, split by scene into 224 training, 28 validation and 28 test scenes. Each scene contains paired RGB/depth frames and camera annotations. Training RGB images and aligned depth maps are 400×300. Depth maps are 16-bit PNGs in millimeters, with zero values indicating missing depth.
-
-Download and extract [ScanNetpp_A4.zip](https://huggingface.co/datasets/learning3dvision/ScanNetpp_iphone/blob/main/ScanNetpp_A4.zip) once for training, validation and test (31.9 GB compressed; 40.7 GB extracted):
+Download the dataset (31.9 GB zipped, 40.7 GB extracted) into `data/scannetpp`:
 
 ```bash
 pip install huggingface_hub
@@ -25,16 +42,36 @@ hf download learning3dvision/ScanNetpp_iphone ScanNetpp_A4.zip --repo-type datas
 unzip data/scannetpp/ScanNetpp_A4.zip -d data/scannetpp
 ```
 
-The training loader applies the preprocessing functions you will implement to data in `processed/`. Validation and test data are already prepared in `prepared_eval/` (128 frames per sequence) and use the provided evaluation loader.
+## Running
 
-## Assignment parts
+Everything goes through `main.py`. To see every step and the exact command it runs:
 
-1. **[Multi-View Data Preprocessing](docs/part1_data.md) (20 points)** — Prepare canonicalized cameras, depth, points and ray embeddings. Complete Q1 and check your geometry.
-2. **[Novel-View Synthesis with Mini-LVSM](docs/part2_lvsm.md) (40 points)** — Predict target RGB from source images and camera rays. Complete Q2 and evaluate the ablations.
-3. **[Multi-View Geometry with Mini-VGGT](docs/part3_vggt.md) (40 points)** — Predict cameras and depth from RGB views. Complete Q3, overfit fixed clips, then train and evaluate.
+```bash
+python main.py --list
+```
 
-The [data contract](docs/DATA_CONTRACT.md) defines shared tensor shapes and coordinate conventions. Each part includes its TODOs, commands, metrics and submission requirements.
+Then run one or more steps by name, for example:
 
-## Submission
+```bash
+python main.py q1-check
+python main.py q2-train q2-eval
+```
 
-Present your results on your assignment webpage, organized into the three parts. Include the requested visualizations, training curves, evaluation metrics and explanations listed in each part's submission block.
+Add `--dry-run` to just print the commands.
+
+| Step | What it does | Output |
+|---|---|---|
+| `q1-unprojection` | viewer of depth unprojected into world space | `outputs/unprojection/index.html` |
+| `q1-canonicalization` | viewer of canonicalized cameras and points | `outputs/canonicalization/index.html` |
+| `q1-check` | reprojection error and centroid checks | printed to the terminal |
+| `q2-overfit` | Q2.1 overfit Mini-LVSM | `outputs/lvsm_overfit/` |
+| `q2-train` | Q2.2 train Mini-LVSM for 400 epochs (the model in the report) | `outputs/lvsm_long/` |
+| `q2-train-default` | Q2.2 default 100-epoch run, for comparison | `outputs/lvsm/` |
+| `q2-eval` | Q2.2 eval at S=1/2/4 with correct, shuffled and no rays | `outputs/lvsm_long/eval_val/` |
+| `q2-bonus` | Q2.3 train with 1 and 4 source views, eval each at 1/2/4 | `outputs/lvsm_s1/`, `outputs/lvsm_s4/` |
+| `q3-overfit` | Q3.1 overfit Mini-VGGT | `outputs/vggt_overfit/` |
+| `q3-train` | Q3.2 train Mini-VGGT for 1000 epochs | `outputs/vggt_train/` |
+| `q3-eval` | Q3.2 val (with 3D viewer) and test metrics, 8 views | `outputs/vggt_train/metrics.json`, `test_metrics.json` |
+| `q3-bonus` | Q3.3 val metrics at 2/4/16 views + speed/memory benchmark | `outputs/vggt_train/bonus_views/` |
+
+The eval steps need the checkpoint from the matching train step. I trained on single RTX 3090s: Mini-LVSM took about 2.7 h for 400 epochs, and Mini-VGGT about 4.4 h for 1000 epochs.
