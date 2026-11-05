@@ -24,16 +24,16 @@ b.best { color:var(--accent); }
 </head>
 <body><main>
 <h1>16-825 Assignment 4: Multi-View Transformers</h1>
-<p class="muted">Data preprocessing · Mini-LVSM novel-view synthesis · Mini-VGGT cameras and depth. All experiments on ScanNet++ (iPhone), 224 px, run on NVIDIA RTX 3090 GPUs.</p>
+<p class="muted">Data preprocessing · Mini-LVSM novel-view synthesis · Mini-VGGT cameras and depth. Everything here uses the ScanNet++ iPhone data at 224 px, and I ran all the experiments on RTX 3090s.</p>
 
 <!-- ================================================================ -->
 <h2>Part 1. Data Preprocessing</h2>
 
 <h3>Unprojection</h3>
-<figure><img src="images/unprojection.png" alt="unprojection"><figcaption>Depth maps of all 8 views unprojected with their (resized) intrinsics and camera-to-world poses. Points from different views overlap consistently in a single world frame.</figcaption></figure>
+<figure><img src="images/unprojection.png" alt="unprojection"><figcaption>All 8 depth maps unprojected using the resized intrinsics and the camera-to-world poses. The points from different views line up on top of each other in the same world frame, which is a good sign the geometry is right.</figcaption></figure>
 
 <h3>Canonicalization</h3>
-<figure><img src="images/canonicalization.png" alt="canonicalization"><figcaption>After canonicalization: the first camera (red frustum) is at the origin, center (0.0000, 0.0000, 0.0000); scene scale 1.867 m; valid-point centroid distance 1.000 normalized units.</figcaption></figure>
+<figure><img src="images/canonicalization.png" alt="canonicalization"><figcaption>After canonicalization the first camera (red frustum) sits right at the origin, center (0.0000, 0.0000, 0.0000). The scene scale for this sample is 1.867 m, and after dividing by it the valid-point centroid is exactly 1.000 away, as expected.</figcaption></figure>
 
 <h3><code>check_data.py</code> output</h3>
 <pre>split: train, dataset_samples: 224, checked_samples: 4
@@ -43,7 +43,7 @@ e050c15a8d_frame_007080       8    224    0.978         1.13e-4              1.0
 47b37eb6f9_frame_002720       8    224    0.961         0.99e-4              0.89e-4               1.0000
 4c5c60fa76_frame_006690       8    224    0.752         1.16e-4              1.07e-4               1.0000
 tensor shapes: images [2,8,3,224,224], ray_directions [2,8,3,224,224], plucker [2,8,6,224,224]</pre>
-<p class="muted">Full JSON is in <code>outputs/check_data.txt</code>. All reprojection errors are ~1e-4 px (float32 round-off), well below 0.01 px.</p>
+<p class="muted">The full JSON is in <code>outputs/check_data.txt</code>. Every reprojection error is around 1e-4 px, which is basically float32 round-off and far under the 0.01 px threshold.</p>
 
 <h3>Explanations</h3>
 <ul>
@@ -54,21 +54,21 @@ tensor shapes: images [2,8,3,224,224], ray_directions [2,8,3,224,224], plucker [
 
 <!-- ================================================================ -->
 <h2>Part 2. Novel-View Synthesis with Mini-LVSM</h2>
-<p>Decoder-only LVSM. Source views are patchified RGB (scaled to [-1, 1]) concatenated with Plücker rays, giving 9 channels. Target queries are patchified Plücker rays only, giving 6 channels. Both get a 2-D sin-cos position embedding. Each target view forms its own sequence <code>[all source tokens, target tokens]</code>, which goes through 8 pre-norm transformer blocks (QK-norm). The target tokens are decoded by a linear head + sigmoid and unpatchified. The loss is pixel MSE.</p>
+<p>This is the decoder-only version of LVSM. For each source view I stack the RGB (shifted to [-1, 1]) with its Plücker rays, so 9 channels, and patchify it. The target view only gets its Plücker rays (6 channels), since that's the image we're trying to predict. Both sides get a 2-D sin-cos position embedding. Every target view becomes its own sequence <code>[all source tokens, target tokens]</code> and goes through 8 pre-norm transformer blocks with QK-norm. At the end I take just the target tokens, run them through a linear head and a sigmoid, and unpatchify them back into an image. The loss is plain pixel MSE.</p>
 
 <h3>Q2.1 Overfitting</h3>
-<p>Final overfit validation PSNR: <b>30.92 dB</b> (SSIM 0.870).</p>
+<p>The overfit run ended at a validation PSNR of <b>30.92 dB</b> (SSIM 0.870), so the model can clearly memorize a scene.</p>
 <figure><img src="images/lvsm_overfit_val_epoch000.png" alt="overfit"><figcaption><code>outputs/lvsm_overfit/val_epoch000.png</code>. Columns: source views, ground truth, prediction.</figcaption></figure>
 
 <h3>Q2.2 Training and evaluation</h3>
-<p><b>Training settings.</b> These are the <code>configs/lvsm.json</code> defaults:</p>
+<p><b>Training settings.</b> I kept the defaults from <code>configs/lvsm.json</code>:</p>
 <ul>
 <li>Model: patch 8, d_model 384, 8 layers, head_dim 64, MLP ratio 4, QK-norm.</li>
 <li>Data: 2 source views + targets from the default data config, batch 4.</li>
 <li>Optimizer: AdamW, lr 2e-4 with β = (0.9, 0.95), weight decay 0.05, 200 warmup steps then cosine decay, grad-clip 1.0, bf16 autocast.</li>
 </ul>
-<p>I first ran the default 100 epochs (0.7 h). The curves were still rising and validation loss was below training loss, a clear sign of underfitting. So the main model was trained for <b>400 epochs</b> (2.7 h, one RTX 3090) with otherwise identical settings. Both runs are reported below; <code>best.pt</code> is selected by validation loss.</p>
-<figure><img src="images/lvsm_curves_long.png" alt="curves"><figcaption>Training curves (MSE, PSNR, val SSIM) for the 400-epoch run (blue) and the default 100-epoch run (orange). Validation is evaluated on fixed held-out scenes and frames, so it is less noisy than train. It is also slightly easier than random training samples, hence val &gt; train PSNR.</figcaption></figure>
+<p>I started with the default 100 epochs (0.7 h). When I looked at the curves they were still going up, and validation loss was below training loss, so the model was obviously underfitting. Because of that I trained the main model for <b>400 epochs</b> instead (2.7 h on one RTX 3090), with everything else the same. I report both runs below. <code>best.pt</code> is the checkpoint with the lowest validation loss.</p>
+<figure><img src="images/lvsm_curves_long.png" alt="curves"><figcaption>Training curves (MSE, PSNR, val SSIM) for the 400-epoch run (blue) and the default 100-epoch run (orange). Validation always uses the same held-out scenes and frames, so it's smoother than the training curve. Those fixed frames also turn out to be a bit easier than random training samples, which is why val PSNR ends up above train PSNR.</figcaption></figure>
 
 <p><b>Validation metrics</b> for the 400-epoch model, PSNR (dB) / SSIM:</p>
 <table>
@@ -77,7 +77,7 @@ tensor shapes: images [2,8,3,224,224], ray_directions [2,8,3,224,224], plucker [
 <tr><td>2</td><td>17.17 / 0.599</td><td>11.25 / 0.460</td><td>12.37 / 0.528</td></tr>
 <tr><td>4</td><td><b class="best">18.35 / 0.621</b></td><td>11.29 / 0.456</td><td>12.38 / 0.539</td></tr>
 </table>
-<p>Default 100-epoch model, for reference:</p>
+<p>And the default 100-epoch model, just for comparison:</p>
 <table>
 <tr><th>Source views</th><th>correct</th><th>shuffled</th><th>none</th></tr>
 <tr><td>1</td><td>15.19 / 0.558</td><td>11.80 / 0.487</td><td>12.47 / 0.529</td></tr>
@@ -105,52 +105,52 @@ tensor shapes: images [2,8,3,224,224], ray_directions [2,8,3,224,224], plucker [
 
 <p><b>Discussion.</b></p>
 <ul>
-<li><b>Number of source views.</b> More source views help monotonically: 15.9 → 17.2 → 18.3 dB for 1 → 2 → 4 views, even though the model was trained with only 2. More views cover more of the target's visible content and constrain geometry better, so the model interpolates rather than hallucinates. Attention over a variable-length set of source tokens generalizes to a different number of views without retraining.</li>
-<li><b>Ray conditioning.</b> Removing the target rays (zeros) drops PSNR by about 5–6 dB. That output does not depend on the number of source views at all (≈12.4 dB everywhere): without knowing where the target camera is, the model can only output a blurry "average view" of the scene. <b>Shuffled</b> rays are even worse than none (11.3 dB, lowest SSIM), because the model confidently renders the scene from the wrong viewpoint. Together these show that the model really uses the Plücker target rays to choose the viewpoint, rather than copying a source image.</li>
-<li><b>Quality.</b> Predictions get the coarse layout, colors and large objects right at the correct place, but are blurry with visible 8×8 patch artifacts. This is expected for a small model (≈15M parameters) trained for a few GPU-hours on 224 training sequences with an MSE loss: MSE averages over uncertainty. Longer training was still improving (curves not converged), so more compute or a perceptual/SSIM loss would sharpen results.</li>
+<li><b>Number of source views.</b> Adding source views helps every time: 15.9 → 17.2 → 18.3 dB going from 1 → 2 → 4 views. What surprised me a bit is that this works even though the model only ever saw 2 views during training. With more views, more of what the target camera sees is actually visible in some source image, and the geometry is better pinned down, so the model can interpolate instead of making things up. Since attention just runs over however many source tokens there are, the model handles a different number of views without any retraining.</li>
+<li><b>Ray conditioning.</b> If I zero out the target rays, PSNR drops by about 5–6 dB. Interestingly, that number is the same (≈12.4 dB) no matter how many source views there are. Without knowing where the target camera is, the best the model can do is output a blurry "average view" of the room. <b>Shuffled</b> rays are even worse than no rays (11.3 dB, and the lowest SSIM), because now the model confidently renders the scene from the wrong viewpoint. So the model really is using the Plücker rays to decide where to look, and isn't just copying one of the source images.</li>
+<li><b>Quality.</b> The predictions get the rough layout, the colors and the big objects in the right place, but they're blurry and you can see the 8×8 patch artifacts. I think that's about what you'd expect from a small model (≈15M parameters) trained for a few GPU-hours on 224 training sequences with MSE, since MSE tends to average over anything uncertain. The curves hadn't converged yet, so more training, or a perceptual/SSIM loss, would probably make the outputs sharper.</li>
 </ul>
 
 <h3>Q2.3 Bonus: training view count</h3>
-<p><b>Question.</b> How does the number of source views used during training affect evaluation with 1, 2 and 4 source views?</p>
-<p><b>Setting.</b> This is a controlled comparison: three models with identical settings (default config, 100 epochs, same seed and schedule). Only <code>num_source_views</code> changes during training (1, 2 or 4). Each model is evaluated on the same validation set at S = 1, 2, 4 with correct rays.</p>
+<p><b>Question.</b> If I change how many source views the model sees during training, how does that change its results when I evaluate with 1, 2 and 4 source views?</p>
+<p><b>Setting.</b> I trained three models that are identical except for <code>num_source_views</code> (1, 2 or 4): same default config, 100 epochs, same seed and schedule. Then I evaluated each one on the same validation set at S = 1, 2 and 4, using the correct rays.</p>
 <table>
 <tr><th>Train S \ Eval S</th><th>1</th><th>2</th><th>4</th><th>train time</th></tr>
 <tr><td>1</td><td>15.12 / 0.559</td><td>14.90 / 0.553</td><td>14.64 / 0.561</td><td>0.52 h</td></tr>
 <tr><td>2</td><td>15.19 / 0.558</td><td>16.13 / 0.560</td><td>16.87 / 0.575</td><td>0.68 h</td></tr>
 <tr><td>4</td><td><b class="best">15.31</b> / 0.556</td><td><b class="best">16.41 / 0.562</b></td><td><b class="best">17.45 / 0.580</b></td><td>0.87 h</td></tr>
 </table>
-<figure><img src="images/lvsm_bonus_views.png" alt=""><figcaption>Validation PSNR/SSIM against the number of evaluation source views for models trained with 1, 2 and 4 source views.</figcaption></figure>
-<figure><img src="images/lvsm_curves_bonus.png" alt=""><figcaption>Training curves of the three models trained with 1, 2 and 4 source views (100 epochs each)</figcaption></figure>
+<figure><img src="images/lvsm_bonus_views.png" alt=""><figcaption>Validation PSNR/SSIM vs. the number of source views at evaluation, one line per training setting (1, 2 or 4 views).</figcaption></figure>
+<figure><img src="images/lvsm_curves_bonus.png" alt=""><figcaption>Training curves for the three models (1, 2 and 4 training views, 100 epochs each)</figcaption></figure>
 <div class="grid2">
 <figure><img src="images/lvsm_s1model_S4.png" alt=""><figcaption>Model trained with S=1, evaluated at S=4</figcaption></figure>
 <figure><img src="images/lvsm_s4model_S4.png" alt=""><figcaption>Model trained with S=4, evaluated at S=4</figcaption></figure>
 </div>
 <p><b>Findings.</b></p>
 <ul>
-<li>The model trained with <b>one</b> view cannot use extra views: its PSNR even <i>drops</i> from 15.1 to 14.6 dB as views are added. It never learned to fuse information across source views, so extra source tokens only act as distractors.</li>
-<li>Training with ≥2 views teaches cross-view fusion, which then extrapolates to more views.</li>
-<li>Training with 4 views is best at <i>every</i> evaluation count, including S=1 (+0.1–0.6 dB over S=2). Each step gives a stronger multi-view geometric signal, and the target is usually well covered, so the gradients are informative rather than "hallucinate unseen content".</li>
-<li>The cost is a longer sequence: the S=4 model trains about 1.3× slower than S=2 for the same epochs.</li>
+<li>The model trained with <b>one</b> view can't make use of extra views at all. Its PSNR actually <i>goes down</i>, from 15.1 to 14.6 dB, as I add views. It never had to combine information from several images, so the extra source tokens just get in the way.</li>
+<li>Once the model is trained with 2 or more views, it learns to fuse across views, and that carries over to more views than it was trained on.</li>
+<li>The 4-view model is the best at <i>every</i> evaluation setting, even S=1 (0.1–0.6 dB better than the 2-view model). My guess is that each training step gives it a stronger multi-view signal, and the target is usually well covered by the sources, so the gradients teach it something useful instead of pushing it to hallucinate content it can't see.</li>
+<li>The downside is longer sequences: for the same number of epochs, the S=4 model takes about 1.3× as long to train as S=2.</li>
 </ul>
-<p><b>Limitations.</b> These are 100-epoch runs (all still underfitting), with one seed each. The gaps at S=1 (≈0.2 dB) are within run-to-run noise. A random number of views per step was not tested, but would likely combine the S=1 robustness with the S=4 fusion ability.</p>
+<p><b>Limitations.</b> These are only 100-epoch runs (all of them still underfitting) and one seed each, so the small gaps at S=1 (≈0.2 dB) are within run-to-run noise. I didn't try sampling a random number of views per step, but I'd expect that to get the robustness of S=1 together with the fusion ability of S=4.</p>
 
 <!-- ================================================================ -->
 <h2>Part 3. Cameras and Depth with Mini-VGGT</h2>
-<p>Architecture:</p>
+<p>Here's a quick overview of the model:</p>
 <ul>
-<li><b>Encoder:</b> frozen DINOv2 ViT-B/14 patch features, projected to 384-d, plus per-view camera and register tokens.</li>
-<li><b>Aggregator:</b> 8 alternating attention pairs. Frame attention runs within each view; global attention runs across all tokens of all views. The frame and global outputs of the final pair are concatenated.</li>
-<li><b>Camera head:</b> predicts a 9-d pose encoding per view (translation, quaternion, FoV).</li>
-<li><b>Depth head:</b> a DPT-style dense head with RGB refinement predicts log-depth and a confidence.</li>
+<li><b>Encoder:</b> I use frozen DINOv2 ViT-B/14 patch features, project them down to 384-d, and add a camera token and register tokens for each view.</li>
+<li><b>Aggregator:</b> 8 pairs of alternating attention. Frame attention only looks inside one view, and global attention looks at all tokens from all views together. The outputs of the last frame block and the last global block get concatenated.</li>
+<li><b>Camera head:</b> outputs a 9-d pose encoding per view (translation, quaternion and FoV).</li>
+<li><b>Depth head:</b> a DPT-style dense head, refined with the RGB image, that outputs log-depth plus a confidence.</li>
 </ul>
-<p>Losses:</p>
+<p>The losses are:</p>
 <ul>
-<li>Camera: L1 on translation, quaternion and FoV.</li>
-<li>Depth: confidence-weighted regression (trimmed mean of <code>c·|Δ| − 0.2·log c</code>), plus a gradient-matching term.</li>
+<li>Camera: L1 on the translation, quaternion and FoV.</li>
+<li>Depth: confidence-weighted regression (trimmed mean of <code>c·|Δ| − 0.2·log c</code>) plus a gradient-matching term.</li>
 </ul>
 
 <h3>Q3.1 Overfitting a single scene</h3>
-<p>After 40 epochs on one scene, camera loss is 0.0026. The total loss becomes negative (−0.15) because of the −log(confidence) term. Predicted geometry matches GT; the predicted centroid distance is 0.999.</p>
+<p>After 40 epochs on a single scene the camera loss is down to 0.0026. The total loss actually goes negative (−0.15), which is fine: it's just the −log(confidence) term once the model gets confident. The predicted geometry lines up with the GT, and the predicted centroid distance comes out at 0.999.</p>
 <figure><img src="images/vggt_overfit_loss.png" alt=""><figcaption>Overfit loss curves (total, camera, depth)</figcaption></figure>
 <div class="grid2">
 <figure><img src="images/vggt_overfit_gt.png" alt=""><figcaption>GT cameras + depth</figcaption></figure>
@@ -158,16 +158,16 @@ tensor shapes: images [2,8,3,224,224], ray_directions [2,8,3,224,224], plucker [
 </div>
 
 <h3>Q3.2 Training and evaluation</h3>
-<p><b>Training settings.</b> These are the <code>configs/vggt.json</code> defaults:</p>
+<p><b>Training settings.</b> Again I used the defaults, this time from <code>configs/vggt.json</code>:</p>
 <ul>
 <li>Data: 8 views sampled within a 32-frame range, 224 px, batch 16.</li>
 <li>Model: embed 384, 6 heads, 8 layers, frozen DINOv2 ViT-B/14.</li>
 <li>Optimizer: AdamW, lr 6e-4, weight decay 0.01, 10 warmup epochs, cosine decay to 0.05×.</li>
 <li>Loss weights: camera 5, depth 1.</li>
-<li>Schedule: 1000 epochs (14 steps each, 224 training sequences), bf16, one RTX 3090, 4.4 h. The best checkpoint (by validation loss) is from epoch 911.</li>
+<li>Schedule: 1000 epochs (14 steps each, 224 training sequences) in bf16 on one RTX 3090, which took 4.4 h. The best checkpoint by validation loss was from epoch 911.</li>
 </ul>
-<p>Evaluation uses 8 views from the first 32 prepared frames, 224 px, seed 825, on the full splits.</p>
-<figure><img src="images/vggt_train_loss.png" alt=""><figcaption>Normal-training loss curves (total, camera, depth; unweighted components)</figcaption></figure>
+<p>For evaluation I use 8 views taken from the first 32 prepared frames, at 224 px with seed 825, over the full splits.</p>
+<figure><img src="images/vggt_train_loss.png" alt=""><figcaption>Loss curves for the normal training run (total, camera and depth; the components are shown unweighted)</figcaption></figure>
 
 <table>
 <tr><th rowspan="2">Split</th><th rowspan="2">AbsRel ↓</th><th rowspan="2">δ1 ↑</th><th colspan="3">Rotation AUC ↑</th><th colspan="3">Translation AUC ↑</th><th colspan="3">Joint pose AUC ↑</th></tr>
@@ -175,9 +175,9 @@ tensor shapes: images [2,8,3,224,224], ray_directions [2,8,3,224,224], plucker [
 <tr><td>val</td><td>0.154</td><td>0.814</td><td>0.245</td><td>0.567</td><td>0.735</td><td>0.025</td><td>0.085</td><td>0.196</td><td>0.011</td><td>0.072</td><td>0.180</td></tr>
 <tr><td>test</td><td>0.167</td><td>0.770</td><td>0.213</td><td>0.536</td><td>0.716</td><td>0.014</td><td>0.054</td><td>0.157</td><td>0.004</td><td>0.034</td><td>0.137</td></tr>
 </table>
-<p class="muted">Each split has 28 samples and 784 pose pairs, with no degenerate pairs. Mean rotation error is 11.3° (val) / 10.1° (test); mean translation-direction error is 42.2° / 42.9°.</p>
+<p class="muted">Each split has 28 samples and 784 pose pairs, and none of the pairs are degenerate. The mean rotation error is 11.3° on val and 10.1° on test; the mean translation-direction error is 42.2° and 42.9°.</p>
 
-<p><b>GT vs prediction on four validation scenes</b> (left: GT camera + depth, right: predicted camera + depth):</p>
+<p><b>GT vs. prediction on four validation scenes</b> (left is the GT cameras + depth, right is what the model predicted):</p>
 <div class="grid2">
 <figure><img src="images/vggt_scene0_gt.png" alt=""><figcaption>Scene 0, GT</figcaption></figure>
 <figure><img src="images/vggt_scene0_prediction.png" alt=""><figcaption>Scene 0, prediction</figcaption></figure>
@@ -191,21 +191,21 @@ tensor shapes: images [2,8,3,224,224], ray_directions [2,8,3,224,224], plucker [
 
 <p><b>Discussion of held-out errors.</b></p>
 <ul>
-<li><b>Depth is good.</b> δ1 is 0.81 / 0.77 and AbsRel 0.15 / 0.17. Predicted point clouds recover the room layout (floor, walls, furniture) and the depth maps are smooth with correct ordering. The main errors are over-smoothed depth discontinuities: in scene 0 the table and chairs merge into one blob, and thin structures such as chair legs and backs disappear. Depth benefits from the strong frozen DINOv2 features, which carry a lot of monocular depth information.</li>
-<li><b>Rotation is reasonable.</b> 73% AUC@30 on val, 11° mean error.</li>
-<li><b>Translation direction is the weak point.</b> AUC@30 is only about 0.2, and since joint pose AUC takes the worse of the two errors, it is limited by translation. Several factors contribute:
+<li><b>Depth works pretty well.</b> δ1 is 0.81 / 0.77 and AbsRel is 0.15 / 0.17 (val / test). The predicted point clouds get the room layout right (floor, walls, furniture), and the depth maps are smooth with the right front-to-back ordering. Most of the error is at depth edges, which get smoothed out too much. In scene 0, for example, the table and chairs blur into one blob, and thin things like chair legs and chair backs disappear. I think a lot of the depth quality comes from the frozen DINOv2 features, which already know a lot about monocular depth.</li>
+<li><b>Rotation is decent.</b> 73% AUC@30 on val, with an 11° mean error.</li>
+<li><b>Translation direction is where it struggles.</b> AUC@30 is only around 0.2, and since joint pose AUC uses the worse of the two errors, translation is what holds it back. I think there are a few reasons:
   <ul>
-  <li>Frames come from 32 consecutive iPhone frames, so baselines are small relative to scene depth (all frusta sit in a tight cluster in the screenshots). The translation <i>direction</i> of a short baseline is ill-conditioned: a small absolute error becomes a large angular error.</li>
-  <li>The model has to infer it from parallax.</li>
-  <li>Only 224 training sequences are available. Val camera loss was still slowly decreasing at epoch 1000, so more data or compute should help.</li>
+  <li>The views come from 32 consecutive iPhone frames, so the camera barely moves compared to how far away the scene is (you can see all the frusta bunched together in the screenshots). With such a short baseline, the translation <i>direction</i> is really sensitive: a tiny position error turns into a big angle error.</li>
+  <li>The model has to figure out translation from parallax alone.</li>
+  <li>There are only 224 training sequences. The val camera loss was still slowly going down at epoch 1000, so more data or more training should help.</li>
   </ul>
-  In the screenshots, the predicted frusta follow the overall trajectory but their positions deviate from GT.</li>
-<li><b>Generalization.</b> Test is slightly worse than val for depth and pose, consistent with distribution shift across rooms. Training loss stays above validation loss because training samples random frame subsets, while evaluation uses a fixed, easier subset; it does not mean the model is underfit.</li>
+  In the screenshots, the predicted frusta follow the general path of the camera, but their positions drift away from the GT.</li>
+<li><b>Generalization.</b> Test is a little worse than val for both depth and pose, which makes sense given that the rooms are different. Training loss stays above validation loss, but that's because training samples random subsets of frames while evaluation uses a fixed and easier subset. It doesn't mean the model is underfitting.</li>
 </ul>
 
 <h3>Q3.3 Bonus: number of input views</h3>
-<p><b>Question.</b> How does the number of input views affect accuracy, runtime and memory?</p>
-<p><b>Setting.</b> The trained model (8 views) is evaluated on the val split with 2, 4, 8 and 16 views drawn from the first 32 prepared frames (same seed 825, 224 px). Latency and peak memory are measured for one forward pass (batch 1, bf16, RTX 3090, averaged after warm-up) for 2–32 views.</p>
+<p><b>Question.</b> How does the number of input views change accuracy, speed and memory?</p>
+<p><b>Setting.</b> I took the model trained with 8 views and evaluated it on the val split with 2, 4, 8 and 16 views, all drawn from the first 32 prepared frames (same seed 825, 224 px). For speed and memory, I timed a single forward pass (batch 1, bf16, RTX 3090, averaged after a warm-up) with anywhere from 2 to 32 views.</p>
 <table>
 <tr><th>Views</th><th>AbsRel ↓</th><th>δ1 ↑</th><th>Rot AUC@15</th><th>Rot AUC@30</th><th>Trans AUC@30</th><th>Pose AUC@30</th><th>pairs</th></tr>
 <tr><td>2</td><td><b class="best">0.117</b></td><td><b class="best">0.857</b></td><td>0.600</td><td>0.746</td><td>0.229</td><td>0.187</td><td>28</td></tr>
@@ -219,15 +219,15 @@ tensor shapes: images [2,8,3,224,224], ray_directions [2,8,3,224,224], plucker [
 <tr><td>ms / view</td><td>12.9</td><td>6.8</td><td>3.2</td><td>2.6</td><td>2.5</td><td>2.6</td></tr>
 <tr><td>peak memory (GB)</td><td>0.74</td><td>0.76</td><td>0.80</td><td>0.89</td><td>0.97</td><td>1.05</td></tr>
 </table>
-<figure><img src="images/vggt_bonus_views.png" alt=""><figcaption>Accuracy, latency and memory against the number of input views</figcaption></figure>
+<figure><img src="images/vggt_bonus_views.png" alt=""><figcaption>Accuracy, latency and memory vs. the number of input views</figcaption></figure>
 <p><b>Findings.</b></p>
 <ul>
-<li><b>More views do not help this model; depth gets steadily worse.</b> AbsRel rises from 0.117 to 0.185 for 2 → 16 views. Pose AUC is roughly flat with a slight downward trend.</li>
-<li><b>Train/test mismatch.</b> The model was only ever trained with 8 views. With 16 views the global attention spreads over twice as many tokens, a distribution it never saw. Each view's depth is then contaminated by more weakly-related tokens.</li>
-<li><b>Different difficulty per setting.</b> More views inside a fixed 32-frame window means more pairs, including wider-baseline pairs that are harder for pose. With 2 views, the depth metric is dominated by the reference view and its nearby frame.</li>
-<li><b>No multi-view benefit for depth.</b> Depth is mostly predicted monocularly from DINO features, so extra views add little.</li>
-<li><b>Runtime and memory are cheap at this scale.</b> Up to 8 views the forward pass is launch-overhead bound (≈26 ms). Beyond that latency grows roughly linearly, as the frozen DINOv2 encoder (per-view cost) dominates. The quadratic global attention over 256·V tokens is still small at V ≤ 32. Per-view cost falls from 12.9 ms to 2.6 ms, and peak memory grows only from 0.74 to 1.05 GB, mostly the DINOv2 weights.</li>
+<li><b>More views don't help this model, and depth actually gets worse.</b> AbsRel goes up from 0.117 to 0.185 going from 2 to 16 views. Pose AUC stays roughly flat, maybe trending down slightly.</li>
+<li><b>Train/test mismatch.</b> The model only ever saw 8 views in training. With 16 views, global attention is spread over twice as many tokens, which it's never seen before, so each view's depth gets mixed with more tokens that aren't very related to it.</li>
+<li><b>The settings aren't equally hard.</b> Picking more views from the same 32-frame window gives more pairs, including wider-baseline pairs that are harder for pose. With only 2 views, the depth number is mostly just the reference view and the frame next to it.</li>
+<li><b>Depth doesn't really use the other views.</b> It's mostly predicted from each image on its own using the DINO features, so extra views don't add much.</li>
+<li><b>Speed and memory are not a problem at this size.</b> Up to 8 views the forward pass takes about 26 ms no matter what, because it's dominated by kernel launch overhead. After that, time grows roughly linearly, since the frozen DINOv2 encoder runs once per view and becomes the main cost. The global attention is quadratic in the 256·V tokens, but at V ≤ 32 that's still small. Time per view drops from 12.9 ms to 2.6 ms, and peak memory only goes from 0.74 to 1.05 GB, most of which is the DINOv2 weights.</li>
 </ul>
-<p><b>Limitations.</b> This is evaluation-time only. Training with a random number of views (e.g. 2–16) would probably remove the degradation at 16 views, and would be the natural next experiment. The metrics with different view counts are computed over different pair sets, so they are not strictly comparable.</p>
+<p><b>Limitations.</b> I only changed the number of views at evaluation time. Training with a random number of views (say 2–16) would probably fix the drop at 16 views, and that's the experiment I'd try next. Also, each view count is scored over a different set of pairs, so the numbers aren't strictly apples-to-apples.</p>
 </main></body>
 </html>
